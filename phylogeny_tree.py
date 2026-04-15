@@ -2,8 +2,13 @@
 Generalizable Phylogeny Tree Diagram Generator
 
 Generates genotype and phenotype pedigree diagrams up to F2 for
-crosses between two lines (A and B). Supports arbitrary ploidy —
-genotypes are specified as tuples of alleles of any length.
+crosses between two lines (A and B).  Supports:
+
+  * Arbitrary ploidy  (haploid, diploid, tetraploid, …)
+  * Autosomal and sex-linked (X-linked / Z-linked) inheritance
+  * Cytoplasmic / maternal-effect factors
+  * Sex-limited expression and sex-specific lethality
+  * Fully custom offspring-generation functions
 
 Usage:
     Modify the CONFIGURATION section at the bottom with your genotypes
@@ -33,7 +38,18 @@ import matplotlib.patches as mpatches
 # Core genetics helpers
 # ---------------------------------------------------------------------------
 
-def gametes(genotype: tuple[str, ...]) -> list[tuple[str, ...]]:
+Genotype = tuple[str, ...]
+Ratios   = dict[Genotype, float]
+
+# A function that, given (sire_genotype, dam_genotype), returns a list of
+# offspring genotypes (one entry per equally-likely outcome).
+OffspringFn = Callable[[Genotype, Genotype], list[Genotype]]
+
+# Phenotype function: (genotype, sex) → phenotype name
+PhenotypeFn = Callable[[Genotype, str], str]
+
+
+def gametes(genotype: Genotype) -> list[Genotype]:
     """Return all possible gametes from a genotype.
 
     For an organism with ploidy *n* the genotype has *n* alleles and each
@@ -47,9 +63,8 @@ def gametes(genotype: tuple[str, ...]) -> list[tuple[str, ...]]:
     if n <= 1:
         return [genotype]
     half = n // 2
-    # Use combinations to model meiosis (order does not matter)
-    seen: set[tuple[str, ...]] = set()
-    result: list[tuple[str, ...]] = []
+    seen: set[Genotype] = set()
+    result: list[Genotype] = []
     for combo in itertools.combinations(genotype, half):
         canon = tuple(sorted(combo))
         if canon not in seen:
@@ -58,7 +73,7 @@ def gametes(genotype: tuple[str, ...]) -> list[tuple[str, ...]]:
     return result
 
 
-def cross(parent_a: tuple[str, ...], parent_b: tuple[str, ...]) -> list[tuple[str, ...]]:
+def cross(parent_a: Genotype, parent_b: Genotype) -> list[Genotype]:
     """Return every possible offspring genotype from two parents.
 
     Each gamete from *parent_a* is combined with each gamete from *parent_b*.
@@ -67,7 +82,7 @@ def cross(parent_a: tuple[str, ...], parent_b: tuple[str, ...]) -> list[tuple[st
     """
     gam_a = gametes(parent_a)
     gam_b = gametes(parent_b)
-    offspring: list[tuple[str, ...]] = []
+    offspring: list[Genotype] = []
     for ga in gam_a:
         for gb in gam_b:
             child = tuple(sorted(ga + gb))
@@ -75,16 +90,39 @@ def cross(parent_a: tuple[str, ...], parent_b: tuple[str, ...]) -> list[tuple[st
     return offspring
 
 
-def offspring_ratios(offspring: list[tuple[str, ...]]) -> dict[tuple[str, ...], float]:
+def offspring_ratios(offspring: list[Genotype]) -> Ratios:
     """Compute genotype → fractional ratio from a list of offspring."""
     counts = Counter(offspring)
     total = len(offspring)
     return {gt: count / total for gt, count in counts.items()}
 
 
-def format_genotype(gt: tuple[str, ...]) -> str:
+def format_genotype(gt: Genotype) -> str:
     """Human-readable genotype string, e.g. ('X', 'x') → 'Xx'."""
     return "".join(gt)
+
+
+# ---------------------------------------------------------------------------
+# Built-in offspring functions
+# ---------------------------------------------------------------------------
+
+def autosomal_offspring(sire: Genotype, dam: Genotype) -> list[Genotype]:
+    """Standard Mendelian cross — same genotypes for both sexes."""
+    return cross(sire, dam)
+
+
+def x_linked_male_offspring(sire: Genotype, dam: Genotype) -> list[Genotype]:
+    """X-linked (XX♀ / XY♂): sons get their X only from their mother.
+
+    The sire's X-linked genotype is NOT passed to sons (they get Y instead).
+    Each son is hemizygous — carrying one maternal gamete.
+    """
+    return gametes(dam)
+
+
+def x_linked_female_offspring(sire: Genotype, dam: Genotype) -> list[Genotype]:
+    """X-linked (XX♀ / XY♂): daughters get X from both parents."""
+    return cross(sire, dam)
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +132,7 @@ def format_genotype(gt: tuple[str, ...]) -> str:
 class Line:
     """A breeding line with separate male and female genotypes."""
 
-    def __init__(self, name: str, male_gt: tuple[str, ...], female_gt: tuple[str, ...]):
+    def __init__(self, name: str, male_gt: Genotype, female_gt: Genotype):
         self.name = name
         self.male_gt = male_gt
         self.female_gt = female_gt
@@ -110,11 +148,11 @@ class CrossResult:
     def __init__(
         self,
         label: str,
-        sire_gt: tuple[str, ...],
-        dam_gt: tuple[str, ...],
-        male_ratios: dict[tuple[str, ...], float],
-        female_ratios: dict[tuple[str, ...], float],
-        phenotype_fn: Callable[[tuple[str, ...], str], str],
+        sire_gt: Genotype,
+        dam_gt: Genotype,
+        male_ratios: Ratios,
+        female_ratios: Ratios,
+        phenotype_fn: PhenotypeFn,
     ):
         self.label = label
         self.sire_gt = sire_gt
@@ -125,7 +163,7 @@ class CrossResult:
 
     # Convenience -----------------------------------------------------------
 
-    def _pheno_ratios(self, ratios: dict[tuple[str, ...], float], sex: str) -> dict[str, float]:
+    def _pheno_ratios(self, ratios: Ratios, sex: str) -> dict[str, float]:
         pheno: dict[str, float] = {}
         for gt, frac in ratios.items():
             p = self.phenotype_fn(gt, sex)
@@ -142,44 +180,48 @@ class CrossResult:
 
     def summary(self) -> str:
         parts = [self.label]
-        parts.append(f"  Sire: {format_genotype(self.sire_gt)}  ×  Dam: {format_genotype(self.dam_gt)}")
-        parts.append("  Males:   " + self._ratio_str(self.male_ratios, self.male_pheno, "male"))
-        parts.append("  Females: " + self._ratio_str(self.female_ratios, self.female_pheno, "female"))
+        parts.append(f"  Sire: {format_genotype(self.sire_gt)}  ×  "
+                     f"Dam: {format_genotype(self.dam_gt)}")
+        parts.append("  Males:   " + self._ratio_str(self.male_ratios,
+                                                      self.male_pheno, "male"))
+        parts.append("  Females: " + self._ratio_str(self.female_ratios,
+                                                      self.female_pheno, "female"))
         return "\n".join(parts)
 
     @staticmethod
-    def _ratio_str(gt_ratios: dict[tuple[str, ...], float],
+    def _ratio_str(gt_ratios: Ratios,
                    ph_ratios: dict[str, float], sex: str) -> str:
-        gt_parts = [f"{format_genotype(gt)} ({v:.2%})" for gt, v in sorted(gt_ratios.items())]
-        ph_parts = [f"{p} ({v:.2%})" for p, v in sorted(ph_ratios.items())]
-        return "Geno: " + ", ".join(gt_parts) + "  |  Pheno: " + ", ".join(ph_parts)
+        gt_parts = [f"{format_genotype(gt)} ({v:.2%})"
+                    for gt, v in sorted(gt_ratios.items())]
+        ph_parts = [f"{p} ({v:.2%})"
+                    for p, v in sorted(ph_ratios.items())]
+        return ("Geno: " + ", ".join(gt_parts) +
+                "  |  Pheno: " + ", ".join(ph_parts))
 
 
 def perform_cross(
     label: str,
-    sire_gt: tuple[str, ...],
-    dam_gt: tuple[str, ...],
-    male_gt_maker: Callable[[tuple[str, ...]], tuple[str, ...]],
-    female_gt_maker: Callable[[tuple[str, ...]], tuple[str, ...]],
-    phenotype_fn: Callable[[tuple[str, ...], str], str],
+    sire_gt: Genotype,
+    dam_gt: Genotype,
+    male_offspring_fn: OffspringFn,
+    female_offspring_fn: OffspringFn,
+    phenotype_fn: PhenotypeFn,
 ) -> CrossResult:
-    """Cross *sire_gt* × *dam_gt* and split offspring into male/female.
+    """Cross *sire_gt* × *dam_gt* and compute male / female offspring ratios.
 
-    ``male_gt_maker`` / ``female_gt_maker`` optionally transform the raw
-    offspring genotype to account for sex-specific chromosome composition
-    (e.g. hemizygous males).  For simple autosomal inheritance, pass the
-    identity function ``lambda gt: gt``.
+    *male_offspring_fn(sire, dam)* returns the list of equally-likely male
+    offspring genotypes.  *female_offspring_fn(sire, dam)* does the same for
+    female offspring.  This design lets you model autosomal, sex-linked, or
+    any custom inheritance pattern.
     """
-    raw = cross(sire_gt, dam_gt)
-    raw_ratios = offspring_ratios(raw)
-    male_ratios: dict[tuple[str, ...], float] = {}
-    female_ratios: dict[tuple[str, ...], float] = {}
-    for gt, frac in raw_ratios.items():
-        m_gt = male_gt_maker(gt)
-        f_gt = female_gt_maker(gt)
-        male_ratios[m_gt] = male_ratios.get(m_gt, 0.0) + frac
-        female_ratios[f_gt] = female_ratios.get(f_gt, 0.0) + frac
-    return CrossResult(label, sire_gt, dam_gt, male_ratios, female_ratios, phenotype_fn)
+    male_raw  = male_offspring_fn(sire_gt, dam_gt)
+    female_raw = female_offspring_fn(sire_gt, dam_gt)
+    return CrossResult(
+        label, sire_gt, dam_gt,
+        offspring_ratios(male_raw),
+        offspring_ratios(female_raw),
+        phenotype_fn,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -189,9 +231,9 @@ def perform_cross(
 def build_pedigree(
     line_a: Line,
     line_b: Line,
-    male_gt_maker: Callable[[tuple[str, ...]], tuple[str, ...]],
-    female_gt_maker: Callable[[tuple[str, ...]], tuple[str, ...]],
-    phenotype_fn: Callable[[tuple[str, ...], str], str],
+    male_offspring_fn: OffspringFn,
+    female_offspring_fn: OffspringFn,
+    phenotype_fn: PhenotypeFn,
 ) -> dict[str, CrossResult]:
     """Build the complete pedigree from two parental lines up to F2.
 
@@ -202,17 +244,17 @@ def build_pedigree(
     # --- F1 ----------------------------------------------------------------
     f1_I = perform_cross(
         "F1 Cross I (A♂ × B♀)", line_a.male_gt, line_b.female_gt,
-        male_gt_maker, female_gt_maker, phenotype_fn,
+        male_offspring_fn, female_offspring_fn, phenotype_fn,
     )
     f1_II = perform_cross(
         "F1 Cross II (B♂ × A♀)", line_b.male_gt, line_a.female_gt,
-        male_gt_maker, female_gt_maker, phenotype_fn,
+        male_offspring_fn, female_offspring_fn, phenotype_fn,
     )
     results["F1_I"] = f1_I
     results["F1_II"] = f1_II
 
     # Representative F1 genotypes (most common) for building F2
-    def _pick_representative(ratios: dict[tuple[str, ...], float]) -> tuple[str, ...]:
+    def _pick_representative(ratios: Ratios) -> Genotype:
         return max(ratios, key=lambda k: ratios[k])
 
     f1_I_male = _pick_representative(f1_I.male_ratios)
@@ -222,15 +264,18 @@ def build_pedigree(
 
     # --- F2 ----------------------------------------------------------------
     f2_labels = [
-        ("F2 I♂×I♀", f1_I_male, f1_I_female),
-        ("F2 I♂×II♀", f1_I_male, f1_II_female),
-        ("F2 II♂×I♀", f1_II_male, f1_I_female),
+        ("F2 I♂×I♀",   f1_I_male,  f1_I_female),
+        ("F2 I♂×II♀",  f1_I_male,  f1_II_female),
+        ("F2 II♂×I♀",  f1_II_male, f1_I_female),
         ("F2 II♂×II♀", f1_II_male, f1_II_female),
     ]
     for lbl, sire, dam in f2_labels:
-        key = lbl.replace(" ", "_").replace("♂", "m").replace("♀", "f").replace("×", "x")
-        results[key] = perform_cross(lbl, sire, dam,
-                                     male_gt_maker, female_gt_maker, phenotype_fn)
+        key = (lbl.replace(" ", "_").replace("♂", "m")
+                   .replace("♀", "f").replace("×", "x"))
+        results[key] = perform_cross(
+            lbl, sire, dam,
+            male_offspring_fn, female_offspring_fn, phenotype_fn,
+        )
 
     return results
 
@@ -506,15 +551,22 @@ if __name__ == "__main__":
     B_FEMALE_GENOTYPE = ("x", "x")       # Line B females
 
     # -----------------------------------------------------------------------
-    # 2.  Sex-specific genotype transformers.
-    #     Use the identity (lambda gt: gt) for simple autosomal loci.
-    #     For sex-linked (hemizygous) schemes you can trim alleles, e.g.:
-    #       male_gt_maker   = lambda gt: gt[:1]   # hemizygous male
-    #       female_gt_maker = lambda gt: gt        # full ploidy female
+    # 2.  Offspring generation functions.
+    #     These define HOW male and female offspring genotypes are produced
+    #     from (sire_genotype, dam_genotype).
+    #
+    #     Built-in options:
+    #       autosomal_offspring         — standard Mendelian (same for ♂/♀)
+    #       x_linked_male_offspring     — sons get X from mother only
+    #       x_linked_female_offspring   — daughters get X from both parents
+    #
+    #     You can also write a fully custom function:
+    #       def my_offspring(sire, dam) -> list[tuple[str, ...]]:
+    #           ...
     # -----------------------------------------------------------------------
 
-    male_gt_maker   = lambda gt: gt       # identity — autosomal
-    female_gt_maker = lambda gt: gt       # identity — autosomal
+    male_offspring_fn   = autosomal_offspring    # same as female for autosomal
+    female_offspring_fn = autosomal_offspring
 
     # -----------------------------------------------------------------------
     # 3.  Phenotype function.
@@ -543,8 +595,8 @@ if __name__ == "__main__":
 
     pedigree = build_pedigree(
         line_a, line_b,
-        male_gt_maker=male_gt_maker,
-        female_gt_maker=female_gt_maker,
+        male_offspring_fn=male_offspring_fn,
+        female_offspring_fn=female_offspring_fn,
         phenotype_fn=phenotype_fn,
     )
 
