@@ -213,7 +213,7 @@ def build_pedigree(
 
     # Representative F1 genotypes (most common) for building F2
     def _pick_representative(ratios: dict[tuple[str, ...], float]) -> tuple[str, ...]:
-        return max(ratios, key=ratios.get)  # type: ignore[arg-type]
+        return max(ratios, key=lambda k: ratios[k])
 
     f1_I_male = _pick_representative(f1_I.male_ratios)
     f1_I_female = _pick_representative(f1_I.female_ratios)
